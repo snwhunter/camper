@@ -1,0 +1,276 @@
+substitutions:
+  device_name: camper-controller
+  friendly_name: Camper Controller
+  # Change these if your relay/sense hardware is active-low.
+  charge_relay_inverted: "false"
+  shore_sense_inverted: "false"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: lcd_backlight
+          brightness: 100%
+      - lambda: |-
+          id(last_touch_ms) = millis();
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Camper Controller Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# ESP32-2432S028R / Cheap Yellow Display pinout.
+# TFT bus and XPT2046 touch controller use separate SPI buses.
+spi:
+  - id: tft_spi
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin: GPIO12
+  - id: touch_spi
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+output:
+  # CYD LCD backlight.
+  - platform: ledc
+    pin: GPIO21
+    id: backlight_pwm
+
+  # GPIO22 is brought out on the CYD expansion connector.
+  # Drive a proper relay/MOSFET input stage, NOT a contactor coil directly.
+  - platform: gpio
+    pin:
+      number: GPIO22
+      inverted: ${charge_relay_inverted}
+    id: charge_relay_output
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: "Display Backlight"
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+switch:
+  - platform: output
+    id: charge_enable
+    name: "Charge Enable Relay"
+    output: charge_relay_output
+    restore_mode: ALWAYS_OFF
+
+# Shore-power detector input. Feed ONLY isolated/conditioned 3.3-V logic here.
+binary_sensor:
+  - platform: gpio
+    id: shore_power
+    name: "Shore Power"
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+        pulldown: true
+      inverted: ${shore_sense_inverted}
+    filters:
+      - delayed_on: 250ms
+      - delayed_off: 250ms
+    on_state:
+      then:
+        - component.update: main_display
+
+# User-set charge ceiling. The controller uses a 5 percentage-point restart
+# hysteresis: e.g. limit 80% -> OFF at 80%, back ON at 75%.
+number:
+  - platform: template
+    id: charge_limit
+    name: "Charge Limit"
+    unit_of_measurement: "%"
+    icon: "mdi:battery-charging"
+    min_value: 50
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    on_value:
+      then:
+        - component.update: main_display
+
+# Placeholder for a LOCAL SOC source. Direct ECO-WORTHY BLE / SmartShunt data
+# will replace/update this in the next stage. It intentionally starts unknown;
+# while SOC is unknown the charge relay is forced OFF (fail-safe).
+sensor:
+  - platform: template
+    id: battery_soc_local
+    name: "Battery SOC Local"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: display_timeout_seconds
+    name: "Display Timeout"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(shore_power).state ? 30.0f : 5.0f;
+
+# Track the most recent touch independently from Home Assistant.
+globals:
+  - id: last_touch_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_medium
+    size: 24
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 56
+
+display:
+  - platform: ili9xxx
+    id: main_display
+    model: ILI9341
+    spi_id: tft_spi
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    rotation: 90
+    invert_colors: false
+    update_interval: 1s
+    lambda: |-
+      it.fill(Color::BLACK);
+
+      // Header / shore state
+      it.printf(8, 6, id(font_small), Color::WHITE, "CAMPER");
+      it.printf(312, 6, id(font_small), Color::WHITE, TextAlign::TOP_RIGHT,
+                id(shore_power).state ? "SHORE" : "BATTERY");
+
+      // Main SOC value
+      if (id(battery_soc_local).has_state() && !isnan(id(battery_soc_local).state)) {
+        it.printf(160, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER,
+                  "%.0f%%", id(battery_soc_local).state);
+      } else {
+        it.printf(160, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER, "--%%");
+      }
+
+      // Charge control status
+      it.printf(8, 130, id(font_medium), Color::WHITE,
+                "Limit %.0f%%", id(charge_limit).state);
+      it.printf(312, 130, id(font_medium), Color::WHITE, TextAlign::TOP_RIGHT,
+                id(charge_enable).state ? "CHARGE ON" : "CHARGE OFF");
+
+      it.printf(8, 174, id(font_small), Color::WHITE,
+                "Touch to wake | timeout %ds",
+                id(shore_power).state ? 30 : 5);
+
+      // Bottom touch targets (visual only for now).
+      it.rectangle(8, 205, 72, 30, Color::WHITE);
+      it.printf(44, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "-5%%");
+      it.rectangle(88, 205, 72, 30, Color::WHITE);
+      it.printf(124, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "+5%%");
+      it.rectangle(168, 205, 144, 30, Color::WHITE);
+      it.printf(240, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "100%% OVERRIDE");
+
+touchscreen:
+  - platform: xpt2046
+    id: main_touch
+    spi_id: touch_spi
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    threshold: 400
+    calibration:
+      x_min: 200
+      x_max: 3900
+      y_min: 200
+      y_max: 3900
+    transform:
+      swap_xy: true
+      mirror_x: true
+    on_touch:
+      - lambda: |-
+          id(last_touch_ms) = millis();
+      - light.turn_on:
+          id: lcd_backlight
+          brightness: 100%
+      # Bottom-row controls. Coordinates assume landscape rotation and may need
+      # calibration adjustment on the individual panel.
+      - if:
+          condition:
+            lambda: 'return touch.y >= 205 && touch.x >= 8 && touch.x < 80;'
+          then:
+            - number.decrement:
+                id: charge_limit
+                cycle: false
+      - if:
+          condition:
+            lambda: 'return touch.y >= 205 && touch.x >= 88 && touch.x < 160;'
+          then:
+            - number.increment:
+                id: charge_limit
+                cycle: false
+      - if:
+          condition:
+            lambda: 'return touch.y >= 205 && touch.x >= 168 && touch.x <= 312;'
+          then:
+            - number.set:
+                id: charge_limit
+                value: 100
+
+interval:
+  # Backlight sleep only; ESP32, BLE/Wi-Fi, relay logic and HA stay alive.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const uint32_t timeout_ms = id(shore_power).state ? 30000UL : 5000UL;
+          if (id(lcd_backlight).current_values.is_on() &&
+              (uint32_t)(millis() - id(last_touch_ms)) >= timeout_ms) {
+            id(lcd_backlight).turn_off().perform();
+          }
+
+  # Local charge-limit controller. If SOC is invalid/unknown, disable charging.
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!id(battery_soc_local).has_state() || isnan(id(battery_soc_local).state)) {
+            if (id(charge_enable).state) id(charge_enable).turn_off();
+            return;
+          }
+
+          const float soc = id(battery_soc_local).state;
+          const float limit = id(charge_limit).state;
+          const float restart = limit - 5.0f;
+
+          if (id(charge_enable).state) {
+            if (soc >= limit) id(charge_enable).turn_off();
+          } else {
+            if (soc <= restart) id(charge_enable).turn_on();
+          }
