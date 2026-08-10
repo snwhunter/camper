@@ -42,7 +42,7 @@ wifi:
 captive_portal:
 
 # ESP32-2432S028R / Cheap Yellow Display pinout.
-# TFT bus and XPT2046 touch controller use separate SPI buses.
+# TFT and XPT2046 touch use separate SPI buses on this board.
 spi:
   - id: tft_spi
     clk_pin: GPIO14
@@ -59,7 +59,7 @@ output:
     pin: GPIO21
     id: backlight_pwm
 
-  # GPIO22 is brought out on the CYD expansion connector.
+  # GPIO22 is exposed on the CYD expansion header.
   # Drive a proper relay/MOSFET input stage, NOT a contactor coil directly.
   - platform: gpio
     pin:
@@ -82,7 +82,8 @@ switch:
     output: charge_relay_output
     restore_mode: ALWAYS_OFF
 
-# Shore-power detector input. Feed ONLY isolated/conditioned 3.3-V logic here.
+# GPIO27 is exposed on the CYD CN1 header.
+# Feed ONLY isolated/conditioned 3.3-V logic here; never connect shore AC directly.
 binary_sensor:
   - platform: gpio
     id: shore_power
@@ -169,12 +170,10 @@ display:
     lambda: |-
       it.fill(Color::BLACK);
 
-      // Header / shore state
       it.printf(8, 6, id(font_small), Color::WHITE, "CAMPER");
       it.printf(312, 6, id(font_small), Color::WHITE, TextAlign::TOP_RIGHT,
                 id(shore_power).state ? "SHORE" : "BATTERY");
 
-      // Main SOC value
       if (id(battery_soc_local).has_state() && !isnan(id(battery_soc_local).state)) {
         it.printf(160, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER,
                   "%.0f%%", id(battery_soc_local).state);
@@ -182,7 +181,6 @@ display:
         it.printf(160, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER, "--%%");
       }
 
-      // Charge control status
       it.printf(8, 130, id(font_medium), Color::WHITE,
                 "Limit %.0f%%", id(charge_limit).state);
       it.printf(312, 130, id(font_medium), Color::WHITE, TextAlign::TOP_RIGHT,
@@ -192,7 +190,6 @@ display:
                 "Touch to wake | timeout %ds",
                 id(shore_power).state ? 30 : 5);
 
-      // Bottom touch targets (visual only for now).
       it.rectangle(8, 205, 72, 30, Color::WHITE);
       it.printf(44, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "-5%%");
       it.rectangle(88, 205, 72, 30, Color::WHITE);
@@ -203,6 +200,7 @@ display:
 touchscreen:
   - platform: xpt2046
     id: main_touch
+    display: main_display
     spi_id: touch_spi
     cs_pin: GPIO33
     interrupt_pin: GPIO36
@@ -221,8 +219,7 @@ touchscreen:
       - light.turn_on:
           id: lcd_backlight
           brightness: 100%
-      # Bottom-row controls. Coordinates assume landscape rotation and may need
-      # calibration adjustment on the individual panel.
+      # Bottom-row controls. Calibration may need adjustment on the individual panel.
       - if:
           condition:
             lambda: 'return touch.y >= 205 && touch.x >= 8 && touch.x < 80;'
