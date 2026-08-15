@@ -1,8 +1,9 @@
 substitutions:
   device_name: camper-controller
   friendly_name: Camper Controller
-  # Change these if your relay/sense hardware is active-low.
-  charge_relay_inverted: "false"
+  # Home Assistant entity for the Govee device that powers the charger.
+  # Change this if HA gave it a different entity_id.
+  charger_entity_id: "switch.camper"
   shore_sense_inverted: "false"
 
 esphome:
@@ -41,8 +42,6 @@ wifi:
 
 captive_portal:
 
-# ESP32-2432S028R / Cheap Yellow Display pinout.
-# TFT and XPT2046 touch use separate SPI buses on this board.
 spi:
   - id: tft_spi
     clk_pin: GPIO14
@@ -54,18 +53,9 @@ spi:
     miso_pin: GPIO39
 
 output:
-  # CYD LCD backlight.
   - platform: ledc
     pin: GPIO21
     id: backlight_pwm
-
-  # GPIO22 is exposed on the CYD expansion header.
-  # Drive a proper relay/MOSFET input stage, NOT a contactor coil directly.
-  - platform: gpio
-    pin:
-      number: GPIO22
-      inverted: ${charge_relay_inverted}
-    id: charge_relay_output
 
 light:
   - platform: monochromatic
@@ -75,15 +65,14 @@ light:
     restore_mode: ALWAYS_ON
     default_transition_length: 0s
 
+# Charge limiting is intentionally disabled by default until ECO-WORTHY SOC is wired in.
 switch:
-  - platform: output
-    id: charge_enable
-    name: "Charge Enable Relay"
-    output: charge_relay_output
-    restore_mode: ALWAYS_OFF
+  - platform: template
+    id: charge_limit_control_enabled
+    name: "Charge Limit Control Enabled"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
 
-# GPIO27 is exposed on the CYD CN1 header.
-# Feed ONLY isolated/conditioned 3.3-V logic here; never connect shore AC directly.
 binary_sensor:
   - platform: gpio
     id: shore_power
@@ -101,8 +90,15 @@ binary_sensor:
       then:
         - component.update: main_display
 
-# User-set charge ceiling. The controller uses a 5 percentage-point restart
-# hysteresis: e.g. limit 80% -> OFF at 80%, back ON at 75%.
+  # Actual charger state mirrored from the Govee entity in Home Assistant.
+  - platform: homeassistant
+    id: charger_state_ha
+    entity_id: ${charger_entity_id}
+    internal: true
+    on_state:
+      then:
+        - component.update: main_display
+
 number:
   - platform: template
     id: charge_limit
@@ -119,10 +115,8 @@ number:
       then:
         - component.update: main_display
 
-# Placeholder for a LOCAL SOC source. Direct ECO-WORTHY BLE / SmartShunt data
-# will replace/update this in the next stage. It intentionally starts unknown;
-# while SOC is unknown the charge relay is forced OFF (fail-safe).
 sensor:
+  # Placeholder until ECO-WORTHY BLE / SmartShunt is connected.
   - platform: template
     id: battery_soc_local
     name: "Battery SOC Local"
@@ -139,7 +133,6 @@ sensor:
     lambda: |-
       return id(shore_power).state ? 30.0f : 5.0f;
 
-# Track the most recent touch independently from Home Assistant.
 globals:
   - id: last_touch_ms
     type: uint32_t
@@ -169,7 +162,6 @@ display:
     update_interval: 1s
     lambda: |-
       it.fill(Color::BLACK);
-
       it.printf(8, 6, id(font_small), Color::WHITE, "CAMPER");
       it.printf(312, 6, id(font_small), Color::WHITE, TextAlign::TOP_RIGHT,
                 id(shore_power).state ? "SHORE" : "BATTERY");
@@ -184,10 +176,12 @@ display:
       it.printf(8, 130, id(font_medium), Color::WHITE,
                 "Limit %.0f%%", id(charge_limit).state);
       it.printf(312, 130, id(font_medium), Color::WHITE, TextAlign::TOP_RIGHT,
-                id(charge_enable).state ? "CHARGE ON" : "CHARGE OFF");
+                id(charger_state_ha).has_state() ?
+                  (id(charger_state_ha).state ? "CHARGER ON" : "CHARGER OFF") : "CHARGER ?");
 
       it.printf(8, 174, id(font_small), Color::WHITE,
-                "Touch to wake | timeout %ds",
+                "Control %s | timeout %ds",
+                id(charge_limit_control_enabled).state ? "ON" : "OFF",
                 id(shore_power).state ? 30 : 5);
 
       it.rectangle(8, 205, 72, 30, Color::WHITE);
@@ -219,7 +213,6 @@ touchscreen:
       - light.turn_on:
           id: lcd_backlight
           brightness: 100%
-      # Bottom-row controls. Calibration may need adjustment on the individual panel.
       - if:
           condition:
             lambda: 'return touch.y >= 205 && touch.x >= 8 && touch.x < 80;'
@@ -241,9 +234,13 @@ touchscreen:
             - number.set:
                 id: charge_limit
                 value: 100
+            - homeassistant.action:
+                action: switch.turn_on
+                data:
+                  entity_id: ${charger_entity_id}
 
 interval:
-  # Backlight sleep only; ESP32, BLE/Wi-Fi, relay logic and HA stay alive.
+  # Backlight sleep only; controller and HA connection stay alive.
   - interval: 250ms
     then:
       - lambda: |-
@@ -253,21 +250,37 @@ interval:
             id(lcd_backlight).turn_off().perform();
           }
 
-  # Local charge-limit controller. If SOC is invalid/unknown, disable charging.
-  - interval: 1s
+  # 5% hysteresis: 80% limit -> charger OFF at >=80%, back ON at <=75%.
+  # The ESP32 makes the decision; Home Assistant operates the Govee device.
+  - interval: 2s
     then:
-      - lambda: |-
-          if (!id(battery_soc_local).has_state() || isnan(id(battery_soc_local).state)) {
-            if (id(charge_enable).state) id(charge_enable).turn_off();
-            return;
-          }
-
-          const float soc = id(battery_soc_local).state;
-          const float limit = id(charge_limit).state;
-          const float restart = limit - 5.0f;
-
-          if (id(charge_enable).state) {
-            if (soc >= limit) id(charge_enable).turn_off();
-          } else {
-            if (soc <= restart) id(charge_enable).turn_on();
-          }
+      - if:
+          condition:
+            switch.is_on: charge_limit_control_enabled
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    return id(battery_soc_local).has_state() &&
+                           !isnan(id(battery_soc_local).state) &&
+                           id(charger_state_ha).has_state() &&
+                           id(charger_state_ha).state &&
+                           id(battery_soc_local).state >= id(charge_limit).state;
+                then:
+                  - homeassistant.action:
+                      action: switch.turn_off
+                      data:
+                        entity_id: ${charger_entity_id}
+            - if:
+                condition:
+                  lambda: |-
+                    return id(battery_soc_local).has_state() &&
+                           !isnan(id(battery_soc_local).state) &&
+                           id(charger_state_ha).has_state() &&
+                           !id(charger_state_ha).state &&
+                           id(battery_soc_local).state <= (id(charge_limit).state - 5.0f);
+                then:
+                  - homeassistant.action:
+                      action: switch.turn_on
+                      data:
+                        entity_id: ${charger_entity_id}
