@@ -5,10 +5,17 @@ substitutions:
   # Change this if HA gave it a different entity_id.
   charger_entity_id: "switch.camper"
   shore_sense_inverted: "false"
+  eco_worthy_bms_mac: "C0:D1:1F:F2:16:3B"
 
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
+  includes:
+    - eco_local_log.h
+  libraries:
+    - SD
+    - FS
+    - SPI
   on_boot:
     priority: -100
     then:
@@ -16,16 +23,31 @@ esphome:
           id: lcd_backlight
           brightness: 100%
       - lambda: |-
+          Serial.begin(115200);
           id(last_touch_ms) = millis();
+          id(sd_card_ready) = eco_local_log::begin();
+          id(sync_pending_count).publish_state(
+              eco_local_log::pending_count_estimate());
 
 esp32:
   board: esp32dev
+  toolchain: platformio
+  watchdog_timeout: 60s
   framework:
     type: arduino
+    advanced:
+      minimum_chip_revision: "3.0"
+      sram1_as_iram: true
+      disable_fatfs: false
+      disable_vfs_support_dir: false
 
 logger:
+  logs:
+    xpt2046: WARN
+    ble_sensor: WARN
 
 api:
+  reboot_timeout: 0s
   encryption:
     key: !secret api_encryption_key
 
@@ -34,13 +56,57 @@ ota:
     password: !secret ota_password
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 10
+    - ssid: !secret wifi_ssid_2
+      password: !secret wifi_password
+      priority: -10
   ap:
     ssid: "Camper Controller Fallback"
     password: !secret fallback_password
 
 captive_portal:
+
+time:
+  - platform: sntp
+    id: network_time
+    timezone: America/Los_Angeles
+
+http_request:
+  id: sheets_http
+  timeout: 45s
+  buffer_size_rx: 2048
+  buffer_size_tx: 512
+  # ESP32's bundled CA set currently rejects the Google Apps Script chain.
+  # The URL remains HTTPS, but certificate identity verification is disabled.
+  verify_ssl: false
+  # Apps Script executes doPost before returning its normal 3xx output redirect.
+  follow_redirects: false
+
+esp32_ble_tracker:
+  id: ble_tracker
+
+ble_client:
+  - mac_address: ${eco_worthy_bms_mac}
+    id: eco_worthy_bms
+    on_connect:
+      then:
+        - delay: 1s
+        # ECO-WORTHY BW02/0B unlock/query frames. Once both are sent, the
+        # battery streams A1 status and A2 cell/temperature packets on FFF1.
+        - ble_client.ble_write:
+            id: eco_worthy_bms
+            service_uuid: FFF0
+            characteristic_uuid: FFF2
+            value: [0xFF, 0x08, 0x02, 0x00, 0x0B, 0x01, 0x00, 0x64, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x2D]
+        - delay: 250ms
+        - ble_client.ble_write:
+            id: eco_worthy_bms
+            service_uuid: FFF0
+            characteristic_uuid: FFF2
+            value: [0xFF, 0x08, 0x02, 0x00, 0x0B, 0x01, 0x00, 0x14, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x65, 0xEF]
 
 spi:
   - id: tft_spi
@@ -48,6 +114,7 @@ spi:
     mosi_pin: GPIO13
     miso_pin: GPIO12
   - id: touch_spi
+    interface: software
     clk_pin: GPIO25
     mosi_pin: GPIO32
     miso_pin: GPIO39
@@ -116,13 +183,139 @@ number:
         - component.update: main_display
 
 sensor:
-  # Placeholder until ECO-WORTHY BLE / SmartShunt is connected.
   - platform: template
     id: battery_soc_local
-    name: "Battery SOC Local"
+    name: "Battery SOC"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     update_interval: never
+
+  - platform: template
+    id: battery_voltage
+    name: "Battery Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    id: battery_current
+    name: "Battery Current"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: battery_power
+    name: "Battery Power"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: battery_temperature
+    name: "Battery Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: battery_cell_delta
+    name: "Battery Cell Delta"
+    unit_of_measurement: "mV"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: battery_remaining_ah
+    name: "Battery Remaining Capacity"
+    unit_of_measurement: "Ah"
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: template
+    id: sync_pending_count
+    name: "Pending Sheet Records"
+    accuracy_decimals: 0
+    update_interval: never
+
+  # Notification-only characteristic. The lambda validates the Modbus CRC,
+  # handles both ECO-WORTHY packet layouts, and publishes decoded sensors.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: eco_worthy_bms
+    id: eco_worthy_notifications
+    internal: true
+    service_uuid: FFF0
+    characteristic_uuid: FFF1
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (x.size() < 10) return {};
+
+      uint16_t crc = 0xFFFF;
+      for (size_t i = 0; i + 2 < x.size(); i++) {
+        crc ^= x[i];
+        for (uint8_t bit = 0; bit < 8; bit++)
+          crc = (crc & 1) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
+      }
+      const uint16_t received_crc =
+          uint16_t(x[x.size() - 2]) | (uint16_t(x[x.size() - 1]) << 8);
+      if (crc != received_crc) {
+        ESP_LOGW("eco_bms", "Ignoring packet with invalid CRC");
+        return {};
+      }
+
+      const bool v2 = x.size() > 6 && (x[6] == 0xA1 || x[6] == 0xA2);
+      const size_t head = v2 ? 6 : 0;
+      const uint8_t packet = x[head];
+      auto u16be = [&](size_t pos) -> uint16_t {
+        return (uint16_t(x[pos]) << 8) | uint16_t(x[pos + 1]);
+      };
+      auto s16be = [&](size_t pos) -> int16_t {
+        return static_cast<int16_t>(u16be(pos));
+      };
+
+      if (packet == 0xA1) {
+        if (id(last_bms_a1_ms) != 0 &&
+            (uint32_t)(millis() - id(last_bms_a1_ms)) < 10000UL) return {};
+        id(last_bms_a1_ms) = millis();
+        const size_t shift = v2 ? 2 : 0;
+        const float soc = u16be(16 - shift);
+        const float volts = u16be(20 - shift) / 100.0f;
+        const float amps = s16be(22 - shift) / (v2 ? 10.0f : 100.0f);
+        const float capacity_ah = u16be(26 - shift) / 100.0f;
+        id(battery_soc_local).publish_state(soc);
+        id(battery_voltage).publish_state(volts);
+        id(battery_current).publish_state(amps);
+        id(battery_power).publish_state(volts * amps);
+        id(battery_remaining_ah).publish_state(capacity_ah * soc / 100.0f);
+        id(main_display).update();
+        ESP_LOGD("eco_bms", "SOC %.0f%%, %.2f V, %.1f A", soc, volts, amps);
+      } else if (packet == 0xA2) {
+        if (id(last_bms_a2_ms) != 0 &&
+            (uint32_t)(millis() - id(last_bms_a2_ms)) < 10000UL) return {};
+        id(last_bms_a2_ms) = millis();
+        const size_t shift = v2 ? 2 : 0;
+        const uint16_t cells = u16be(14 - shift);
+        if (cells > 0 && cells <= 16) {
+          uint16_t cell_min = 0xFFFF;
+          uint16_t cell_max = 0;
+          for (uint16_t i = 0; i < cells; i++) {
+            const uint16_t mv = u16be(16 - shift + i * 2);
+            cell_min = std::min(cell_min, mv);
+            cell_max = std::max(cell_max, mv);
+          }
+          id(battery_cell_delta).publish_state(cell_max - cell_min);
+        }
+        const uint16_t temps = u16be(80 - shift);
+        if (temps > 0 && temps <= 8)
+          id(battery_temperature).publish_state(u16be(82 - shift) / 10.0f);
+      }
+      return {};
 
   - platform: template
     id: display_timeout_seconds
@@ -134,10 +327,34 @@ sensor:
       return id(shore_power).state ? 30.0f : 5.0f;
 
 globals:
+  - id: last_bms_a1_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_bms_a2_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   - id: last_touch_ms
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  - id: sd_card_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: sync_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: pending_sync_sequence
+    type: uint64_t
+    restore_value: no
+    initial_value: '0'
+  - id: pending_sync_json
+    type: std::string
+    restore_value: no
+    initial_value: '""'
 
 font:
   - file: "gfonts://Roboto"
@@ -151,9 +368,11 @@ font:
     size: 56
 
 display:
-  - platform: ili9xxx
+  - platform: mipi_spi
     id: main_display
     model: ILI9341
+    color_depth: 8bit
+    buffer_size: 12.5%
     spi_id: tft_spi
     cs_pin: GPIO15
     dc_pin: GPIO2
@@ -180,9 +399,11 @@ display:
                   (id(charger_state_ha).state ? "CHARGER ON" : "CHARGER OFF") : "CHARGER ?");
 
       it.printf(8, 174, id(font_small), Color::WHITE,
-                "Control %s | timeout %ds",
+                "Control %s | SD %s | Q %.0f",
                 id(charge_limit_control_enabled).state ? "ON" : "OFF",
-                id(shore_power).state ? 30 : 5);
+                id(sd_card_ready) ? "OK" : "ERR",
+                id(sync_pending_count).has_state() ?
+                  id(sync_pending_count).state : 0.0f);
 
       it.rectangle(8, 205, 72, 30, Color::WHITE);
       it.printf(44, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "-5%%");
@@ -197,7 +418,7 @@ touchscreen:
     display: main_display
     spi_id: touch_spi
     cs_pin: GPIO33
-    interrupt_pin: GPIO36
+    update_interval: 50ms
     threshold: 400
     calibration:
       x_min: 200
@@ -240,6 +461,12 @@ touchscreen:
                   entity_id: ${charger_entity_id}
 
 interval:
+  # A PC can send SD_EXPORT over USB serial to download logs without removing
+  # the card. Framed hex records keep normal boot output out of the files.
+  - interval: 250ms
+    then:
+      - lambda: eco_local_log::poll_usb_command();
+
   # Backlight sleep only; controller and HA connection stay alive.
   - interval: 250ms
     then:
@@ -284,3 +511,114 @@ interval:
                       action: switch.turn_on
                       data:
                         entity_id: ${charger_entity_id}
+
+  # Durable local-first sample. A row is queued only after the SD append and
+  # sequence-state update both succeed.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!id(sd_card_ready) ||
+              !id(battery_soc_local).has_state() ||
+              !id(battery_voltage).has_state() ||
+              !id(battery_current).has_state()) return;
+          auto now = id(network_time).now();
+          const std::string day = now.is_valid() ? now.strftime("%Y-%m-%d") : "undated";
+          const std::string timestamp = now.is_valid() ?
+              now.strftime("%Y-%m-%dT%H:%M:%S%z") : "";
+          const uint64_t sequence = eco_local_log::peek_next_sequence();
+          char json[768];
+          snprintf(json, sizeof(json),
+              "{\"device_id\":\"${device_name}\",\"sequence_id\":%llu,"
+              "\"timestamp\":\"%s\",\"soc\":%.0f,\"voltage\":%.2f,"
+              "\"current\":%.2f,\"power\":%.1f,\"remaining_ah\":%.1f,"
+              "\"temperature\":%.1f,\"cell_delta_mv\":%.0f,\"synced\":false}",
+              static_cast<unsigned long long>(sequence), timestamp.c_str(),
+              id(battery_soc_local).state, id(battery_voltage).state,
+              id(battery_current).state, id(battery_power).state,
+              id(battery_remaining_ah).has_state() ? id(battery_remaining_ah).state : NAN,
+              id(battery_temperature).has_state() ? id(battery_temperature).state : NAN,
+              id(battery_cell_delta).has_state() ? id(battery_cell_delta).state : NAN);
+          uint64_t written_sequence = 0;
+          if (!eco_local_log::append(day.c_str(), json, written_sequence)) {
+            id(sd_card_ready) = false;
+            ESP_LOGE("eco_log", "Failed to append sample to SD");
+            id(main_display).update();
+            return;
+          }
+          eco_local_log::prune_synced(day.c_str());
+          id(sync_pending_count).publish_state(
+              eco_local_log::pending_count_estimate());
+          ESP_LOGI("eco_log", "Queued SD record %llu; pending=%llu",
+                   static_cast<unsigned long long>(written_sequence),
+                   static_cast<unsigned long long>(eco_local_log::pending_count_estimate()));
+          id(main_display).update();
+
+  # Upload up to two oldest unsynced records in one request. HTTP 2xx/3xx is
+  # the acknowledgement; only then is the durable cursor advanced. Failures
+  # leave the entire batch queued for an idempotent retry.
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(sd_card_ready) || id(sync_in_progress) ||
+                  !network::is_connected()) {
+                if (!network::is_connected())
+                  ESP_LOGD("eco_sync", "Skipping sync; WiFi is offline");
+                return false;
+              }
+              String json;
+              uint64_t highest_sequence = 0;
+              const size_t count =
+                  eco_local_log::next_pending_batch(json, highest_sequence, 2);
+              if (count == 0) {
+                ESP_LOGD("eco_sync", "No pending SD record found");
+                return false;
+              }
+              id(pending_sync_json) = json.c_str();
+              id(pending_sync_sequence) = highest_sequence;
+              id(sync_in_progress) = true;
+              ESP_LOGI("eco_sync", "Uploading %u SD records through %llu",
+                       static_cast<unsigned>(count),
+                       static_cast<unsigned long long>(highest_sequence));
+              return true;
+          then:
+            # Avoid BLE notification allocations competing with the TLS heap.
+            - lambda: 'id(eco_worthy_bms).set_auto_connect(false);'
+            - ble_client.disconnect: eco_worthy_bms
+            - delay: 1s
+            - ble.disable:
+            - delay: 2s
+            - http_request.post:
+                id: sheets_http
+                url: !secret sheets_url
+                request_headers:
+                  Content-Type: application/json
+                body: !lambda 'return id(pending_sync_json);'
+                on_response:
+                  then:
+                    - lambda: |-
+                        ESP_LOGI("eco_sync", "Sheets response for %llu: HTTP %d",
+                                 static_cast<unsigned long long>(id(pending_sync_sequence)),
+                                 response->status_code);
+                        if (response->status_code >= 200 && response->status_code < 400) {
+                          eco_local_log::acknowledge(id(pending_sync_sequence));
+                          id(sync_pending_count).publish_state(
+                              eco_local_log::pending_count_estimate());
+                        }
+                        id(sync_in_progress) = false;
+                        id(eco_worthy_bms).set_auto_connect(true);
+                        id(main_display).update();
+                    - ble.enable:
+                    - delay: 2s
+                    - ble_client.connect: eco_worthy_bms
+                on_error:
+                  then:
+                    - lambda: |-
+                        ESP_LOGE("eco_sync", "Sheets request failed for %llu",
+                                 static_cast<unsigned long long>(id(pending_sync_sequence)));
+                        id(sync_in_progress) = false;
+                        id(eco_worthy_bms).set_auto_connect(true);
+                    - ble.enable:
+                    - delay: 2s
+                    - ble_client.connect: eco_worthy_bms
