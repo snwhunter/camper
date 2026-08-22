@@ -25,6 +25,7 @@ esphome:
       - lambda: |-
           Serial.begin(115200);
           id(last_touch_ms) = millis();
+          id(last_sheets_upload_ms) = millis();
           id(sd_card_ready) = eco_local_log::begin();
           id(sync_pending_count).publish_state(
               eco_local_log::pending_count_estimate());
@@ -180,6 +181,24 @@ number:
     initial_value: 100
     on_value:
       then:
+        - component.update: main_display
+
+select:
+  - platform: template
+    id: sheets_upload_interval
+    name: "Google Sheets Upload Interval"
+    icon: "mdi:cloud-upload"
+    optimistic: true
+    restore_value: true
+    initial_option: "1 min"
+    options:
+      - "1 min"
+      - "2 min"
+      - "5 min"
+      - "10 min"
+    on_value:
+      then:
+        - lambda: 'id(last_sheets_upload_ms) = millis();'
         - component.update: main_display
 
 sensor:
@@ -355,6 +374,14 @@ globals:
     type: std::string
     restore_value: no
     initial_value: '""'
+  - id: last_sheets_upload_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: settings_screen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 font:
   - file: "gfonts://Roboto"
@@ -381,6 +408,28 @@ display:
     update_interval: 1s
     lambda: |-
       it.fill(Color::BLACK);
+      if (id(settings_screen)) {
+        it.printf(8, 6, id(font_medium), Color::WHITE, "SETTINGS");
+        it.printf(312, 10, id(font_small), Color::WHITE, TextAlign::TOP_RIGHT,
+                  "BLE 10 sec");
+        it.printf(8, 48, id(font_small), Color::WHITE,
+                  "Google Sheets upload interval");
+        const char *labels[] = {"1 min", "2 min", "5 min", "10 min"};
+        const size_t selected_index = id(sheets_upload_interval).active_index().value_or(0);
+        for (int i = 0; i < 4; i++) {
+          const int x = 8 + i * 78;
+          const bool active = selected_index == static_cast<size_t>(i);
+          it.rectangle(x, 82, 70, 44, active ? Color(0, 255, 0) : Color::WHITE);
+          it.printf(x + 35, 94, id(font_small), active ? Color(0, 255, 0) : Color::WHITE,
+                    TextAlign::TOP_CENTER, "%s", labels[i]);
+        }
+        it.printf(8, 150, id(font_small), Color::WHITE,
+                  "Selected: %s", labels[selected_index]);
+        it.rectangle(88, 195, 144, 38, Color::WHITE);
+        it.printf(160, 205, id(font_small), Color::WHITE,
+                  TextAlign::TOP_CENTER, "BACK");
+        return;
+      }
       it.printf(8, 6, id(font_small), Color::WHITE, "CAMPER");
       it.printf(312, 6, id(font_small), Color::WHITE, TextAlign::TOP_RIGHT,
                 id(shore_power).state ? "SHORE" : "BATTERY");
@@ -405,12 +454,14 @@ display:
                 id(sync_pending_count).has_state() ?
                   id(sync_pending_count).state : 0.0f);
 
-      it.rectangle(8, 205, 72, 30, Color::WHITE);
-      it.printf(44, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "-5%%");
-      it.rectangle(88, 205, 72, 30, Color::WHITE);
-      it.printf(124, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "+5%%");
-      it.rectangle(168, 205, 144, 30, Color::WHITE);
-      it.printf(240, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "100%% OVERRIDE");
+      it.rectangle(8, 205, 56, 30, Color::WHITE);
+      it.printf(36, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "-5%%");
+      it.rectangle(70, 205, 56, 30, Color::WHITE);
+      it.printf(98, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "+5%%");
+      it.rectangle(132, 205, 100, 30, Color::WHITE);
+      it.printf(182, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "100%%");
+      it.rectangle(238, 205, 74, 30, Color::WHITE);
+      it.printf(275, 211, id(font_small), Color::WHITE, TextAlign::TOP_CENTER, "SETTINGS");
 
 touchscreen:
   - platform: xpt2046
@@ -436,21 +487,36 @@ touchscreen:
           brightness: 100%
       - if:
           condition:
-            lambda: 'return touch.y >= 205 && touch.x >= 8 && touch.x < 80;'
+            lambda: 'return id(settings_screen) && touch.y >= 82 && touch.y < 126;'
+          then:
+            - lambda: |-
+                if (touch.x >= 8 && touch.x < 78) id(sheets_upload_interval).publish_state("1 min");
+                else if (touch.x >= 86 && touch.x < 156) id(sheets_upload_interval).publish_state("2 min");
+                else if (touch.x >= 164 && touch.x < 234) id(sheets_upload_interval).publish_state("5 min");
+                else if (touch.x >= 242 && touch.x < 312) id(sheets_upload_interval).publish_state("10 min");
+      - if:
+          condition:
+            lambda: 'return id(settings_screen) && touch.y >= 195 && touch.x >= 88 && touch.x <= 232;'
+          then:
+            - lambda: 'id(settings_screen) = false;'
+            - component.update: main_display
+      - if:
+          condition:
+            lambda: 'return !id(settings_screen) && touch.y >= 205 && touch.x >= 8 && touch.x < 64;'
           then:
             - number.decrement:
                 id: charge_limit
                 cycle: false
       - if:
           condition:
-            lambda: 'return touch.y >= 205 && touch.x >= 88 && touch.x < 160;'
+            lambda: 'return !id(settings_screen) && touch.y >= 205 && touch.x >= 70 && touch.x < 126;'
           then:
             - number.increment:
                 id: charge_limit
                 cycle: false
       - if:
           condition:
-            lambda: 'return touch.y >= 205 && touch.x >= 168 && touch.x <= 312;'
+            lambda: 'return !id(settings_screen) && touch.y >= 205 && touch.x >= 132 && touch.x < 232;'
           then:
             - number.set:
                 id: charge_limit
@@ -459,6 +525,12 @@ touchscreen:
                 action: switch.turn_on
                 data:
                   entity_id: ${charger_entity_id}
+      - if:
+          condition:
+            lambda: 'return !id(settings_screen) && touch.y >= 205 && touch.x >= 238 && touch.x <= 312;'
+          then:
+            - lambda: 'id(settings_screen) = true;'
+            - component.update: main_display
 
 interval:
   # A PC can send SD_EXPORT over USB serial to download logs without removing
@@ -514,7 +586,7 @@ interval:
 
   # Durable local-first sample. A row is queued only after the SD append and
   # sequence-state update both succeed.
-  - interval: 60s
+  - interval: 10s
     then:
       - lambda: |-
           if (!id(sd_card_ready) ||
@@ -553,14 +625,22 @@ interval:
                    static_cast<unsigned long long>(eco_local_log::pending_count_estimate()));
           id(main_display).update();
 
-  # Upload up to two oldest unsynced records in one request. HTTP 2xx/3xx is
-  # the acknowledgement; only then is the durable cursor advanced. Failures
-  # leave the entire batch queued for an idempotent retry.
-  - interval: 60s
+  # Upload one selected interval of 10-second records (6/12/30/60). HTTP
+  # 2xx/3xx is the acknowledgement; only then is the durable cursor advanced.
+  # Failures leave the entire batch queued for an idempotent retry.
+  - interval: 1s
     then:
       - if:
           condition:
             lambda: |-
+              const size_t selected_index =
+                  id(sheets_upload_interval).active_index().value_or(0);
+              const uint32_t upload_intervals_ms[] = {
+                  60000UL, 120000UL, 300000UL, 600000UL};
+              const uint32_t upload_interval_ms = upload_intervals_ms[selected_index];
+              if ((uint32_t)(millis() - id(last_sheets_upload_ms)) < upload_interval_ms)
+                return false;
+              id(last_sheets_upload_ms) = millis();
               if (!id(sd_card_ready) || id(sync_in_progress) ||
                   !network::is_connected()) {
                 if (!network::is_connected())
@@ -569,8 +649,10 @@ interval:
               }
               String json;
               uint64_t highest_sequence = 0;
-              const size_t count =
-                  eco_local_log::next_pending_batch(json, highest_sequence, 2);
+              const size_t records_per_interval[] = {6, 12, 30, 60};
+              const size_t records_per_upload = records_per_interval[selected_index];
+              const size_t count = eco_local_log::next_pending_batch(
+                  json, highest_sequence, records_per_upload);
               if (count == 0) {
                 ESP_LOGD("eco_sync", "No pending SD record found");
                 return false;
