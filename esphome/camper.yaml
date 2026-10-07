@@ -218,6 +218,13 @@ sensor:
     update_interval: never
 
   - platform: template
+    id: battery_voltage_soc
+    name: "Battery Voltage SOC"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
     id: battery_current
     name: "Battery Current"
     unit_of_measurement: "A"
@@ -309,6 +316,35 @@ sensor:
         const float capacity_ah = u16be(26 - shift) / 100.0f;
         id(battery_soc_local).publish_state(soc);
         id(battery_voltage).publish_state(volts);
+
+        // Approximate 12.8 V LiFePO4 SOC from pack voltage. This is most
+        // meaningful at rest; load and charging current will shift voltage.
+        const float voltage_points[] = {
+          12.50f, 12.80f, 12.90f, 13.00f, 13.10f,
+          13.15f, 13.20f, 13.25f, 13.30f, 13.35f, 13.40f
+        };
+        const float soc_points[] = {
+           0.0f, 10.0f, 15.0f, 25.0f, 40.0f,
+          55.0f, 70.0f, 80.0f, 90.0f, 95.0f, 100.0f
+        };
+        float voltage_soc = 0.0f;
+        if (volts >= voltage_points[10]) {
+          voltage_soc = 100.0f;
+        } else if (volts <= voltage_points[0]) {
+          voltage_soc = 0.0f;
+        } else {
+          for (int i = 0; i < 10; i++) {
+            if (volts >= voltage_points[i] && volts < voltage_points[i + 1]) {
+              const float fraction =
+                  (volts - voltage_points[i]) /
+                  (voltage_points[i + 1] - voltage_points[i]);
+              voltage_soc =
+                  soc_points[i] + fraction * (soc_points[i + 1] - soc_points[i]);
+              break;
+            }
+          }
+        }
+        id(battery_voltage_soc).publish_state(voltage_soc);
         id(battery_current).publish_state(amps);
         id(battery_power).publish_state(volts * amps);
         id(battery_remaining_ah).publish_state(capacity_ah * soc / 100.0f);
@@ -435,10 +471,18 @@ display:
                 id(shore_power).state ? "SHORE" : "BATTERY");
 
       if (id(battery_soc_local).has_state() && !isnan(id(battery_soc_local).state)) {
-        it.printf(160, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER,
+        it.printf(125, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER,
                   "%.0f%%", id(battery_soc_local).state);
       } else {
-        it.printf(160, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER, "--%%");
+        it.printf(125, 48, id(font_big), Color::WHITE, TextAlign::TOP_CENTER, "--%%");
+      }
+
+      if (id(battery_voltage_soc).has_state() && !isnan(id(battery_voltage_soc).state)) {
+        it.printf(255, 68, id(font_medium), Color::WHITE, TextAlign::TOP_CENTER,
+                  "V %.0f%%", id(battery_voltage_soc).state);
+      } else {
+        it.printf(255, 68, id(font_medium), Color::WHITE, TextAlign::TOP_CENTER,
+                  "V --%%");
       }
 
       it.printf(8, 130, id(font_medium), Color::WHITE,
